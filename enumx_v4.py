@@ -607,6 +607,26 @@ async def run_nmap(target: str, out_dir: Path) -> Optional[Path]:
         warn("nmap failed")
         return None
     info("Nmap complete")
+
+    # ── Optional UDP scan ─────────────────────────────────────────────────────
+    if ask("Also run UDP scan? (top 20 ports, requires sudo)"):
+        udp_top  = prompt("Number of top UDP ports to scan", "20")
+        udp_xml  = out_dir / "udp.xml"
+        udp_txt  = out_dir / "udp.txt"
+        udp_cmd  = ["sudo", "nmap", "-sU", "--top-ports", udp_top,
+                    "-oX", str(udp_xml), "-oN", str(udp_txt), target]
+        info(f"Starting UDP scan (top {udp_top} ports)...")
+        stop_u  = threading.Event()
+        spin_u  = threading.Thread(target=_spinner, args=(f"nmap UDP top-{udp_top}", stop_u), daemon=True)
+        spin_u.start()
+        await run_cmd(udp_cmd, silent=True)
+        stop_u.set()
+        spin_u.join()
+        if udp_xml.exists():
+            info("UDP scan complete")
+        else:
+            warn("UDP scan failed or returned no results")
+
     return xml
 
 # ══════════════════════════════════ RECON ══════════════════════════════════════
@@ -1737,6 +1757,16 @@ async def main_core():
             return
 
     services = parse_nmap_xml(xml_path)
+    udp_xml = base_out / "udp.xml"
+    if udp_xml.exists():
+        udp_services = parse_nmap_xml(udp_xml)
+        existing = {s.port for s in services}
+        for s in udp_services:
+            if s.port not in existing:
+                services.append(s)
+        if udp_services:
+            info(f"Merged {len(udp_services)} UDP service(s) into results")
+
     if not services:
         error("No open services found")
         return
