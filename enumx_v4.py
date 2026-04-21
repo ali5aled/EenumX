@@ -1090,7 +1090,56 @@ async def enum_rdp(target: str, ports: List[int], out_dir: Path, creds: CredMana
         await asyncio.gather(*tasks)
 
 # ═══════════════════════════════════ SNMP ══════════════════════════════════════
-async def enum_snmp(target: str, ports: List[int], out_dir: Path, report: Report):
+def parse_snmp_creds(content: str) -> List[Tuple[str, str]]:
+    """
+    Extract credentials leaked in SNMP process argument strings.
+    Catches common CLI flag patterns found in hrSWRunParameters (OID .25.4.2.1.5)
+    and generic key=value config patterns inside STRING values.
+    """
+    results: List[Tuple[str, str]] = []
+    for line in content.splitlines():
+        if "STRING:" not in line:
+            continue
+        val = line.split("STRING:", 1)[1].strip().strip('"')
+
+        # -u USER -p PASS  (any order)
+        u = re.search(r'(?<!\w)-u\s+(\S+)', val)
+        p = re.search(r'(?<!\w)-p\s+(\S+)', val)
+        if u and p:
+            results.append((u.group(1), p.group(1)))
+            continue
+
+        # --username USER --password PASS  (or = variants)
+        u = re.search(r'--username[=\s]+(\S+)', val)
+        p = re.search(r'--password[=\s]+(\S+)', val)
+        if u and p:
+            results.append((u.group(1), p.group(1)))
+            continue
+
+        # username=USER password=PASS  /  user=USER pass=PASS
+        u = re.search(r'(?:username|user)[=:]\s*(\S+)', val, re.IGNORECASE)
+        p = re.search(r'(?:password|passwd|pass)[=:]\s*(\S+)', val, re.IGNORECASE)
+        if u and p:
+            results.append((u.group(1), p.group(1)))
+            continue
+
+        # -U USER -P PASS  (uppercase flags, e.g. snmp, ftp tools)
+        u = re.search(r'(?<!\w)-U\s+(\S+)', val)
+        p = re.search(r'(?<!\w)-P\s+(\S+)', val)
+        if u and p:
+            results.append((u.group(1), p.group(1)))
+
+    # deduplicate while preserving order
+    seen = set()
+    unique = []
+    for pair in results:
+        if pair not in seen:
+            seen.add(pair)
+            unique.append(pair)
+    return unique
+
+
+async def enum_snmp(target: str, ports: List[int], out_dir: Path, creds: CredManager, report: Report):
     section(f"SNMP Enumeration  –  ports {ports}")
     if not which("snmpwalk"):
         warn("snmpwalk not found")
@@ -1098,6 +1147,7 @@ async def enum_snmp(target: str, ports: List[int], out_dir: Path, report: Report
     snmp_dir = out_dir / "snmp"
     snmp_dir.mkdir(parents=True, exist_ok=True)
     tasks = []
+    output_files: List[Path] = []
 
     if ask("SNMP community string enum?"):
         communities = ["public", "private", "community", "manager", "secret"]
@@ -1106,14 +1156,55 @@ async def enum_snmp(target: str, ports: List[int], out_dir: Path, report: Report
             communities += [x.strip() for x in extra.split(",") if x.strip()]
         for p in ports:
             for comm in communities:
+                out_file = snmp_dir / f"{comm}_{p}.txt"
+                output_files.append(out_file)
                 tasks.append(run_cmd(
                     ["snmpwalk", "-c", comm, "-v2c", f"{target}:{p}", "."],
-                    stdout_file=snmp_dir / f"{comm}_{p}.txt",
+                    stdout_file=out_file,
                 ))
         report.add_finding(f"SNMP community enum ({len(communities)} strings)")
 
     if tasks:
         await asyncio.gather(*tasks)
+
+    # ── Credential extraction from all SNMP output files ─────────────────────
+    section("SNMP Credential Parser")
+    total_found = 0
+    for out_file in output_files:
+        if not out_file.exists() or out_file.stat().st_size == 0:
+            continue
+        content       = out_file.read_text(errors="ignore")
+        leaked_creds  = parse_snmp_creds(content)
+        if leaked_creds:
+            found(f"Credentials leaked in {out_file.name}:")
+            for user, passwd in leaked_creds:
+                print(c(RED, f"    username : {user}"))
+                print(c(RED, f"    password : {passwd}"))
+                print()
+                creds.add(user, passwd)
+                report.add_cred(f"SNMP:{user}:{passwd}  (source: {out_file.name})")
+                total_found += 1
+        else:
+            # Still surface any STRING lines that mention common keywords
+            # so the analyst can eyeball them even if pattern didn't match
+            hits = [l.strip() for l in content.splitlines()
+                    if "STRING:" in l and
+                    re.search(r'(?i)(passw|secret|token|apikey|key|credential)', l)]
+            if hits:
+                warn(f"{out_file.name} — suspicious strings (manual review):")
+                for h in hits[:10]:
+                    print(c(YELLOW, f"    {h}"))
+                cred_hints_file = snmp_dir / f"cred_hints_{out_file.stem}.txt"
+                cred_hints_file.write_text("\n".join(hits), encoding="utf-8")
+                report.add_finding(
+                    f"SNMP {out_file.name}: suspicious strings saved to {cred_hints_file.name}",
+                    "HIGH",
+                )
+
+    if total_found:
+        info(f"SNMP credential extraction complete — {total_found} credential(s) added to session")
+    else:
+        info("No credentials extracted from SNMP output")
 
 # ══════════════════════════════ DATABASE ATTACKS ════════════════════════════════
 DB_DEFAULTS = {
@@ -1829,7 +1920,7 @@ async def main_core():
         await enum_rdp(args.target, rdp_ports, base_out, creds, report)
 
     if snmp_ports and ask(f"SNMP enumeration on {snmp_ports}?"):
-        await enum_snmp(args.target, snmp_ports, base_out, report)
+        await enum_snmp(args.target, snmp_ports, base_out, creds, report)
 
     if db_svcs and ask("Database attacks?"):
         await enum_db(args.target, db_svcs, base_out, creds, report)
