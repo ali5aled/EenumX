@@ -470,6 +470,42 @@ Prompts for community string guessing. Default strings tested: `public`, `privat
 
 If a valid community string is found, `snmpwalk` dumps the full OID tree — this often reveals running processes, network interfaces, installed software, and user accounts.
 
+#### Automatic Credential Extraction
+
+After all snmpwalk tasks finish, EnumX automatically parses every output file for credentials leaked inside process argument strings (OID `hrSWRunParameters` — `.1.3.6.1.2.1.25.4.2.1.5`). This is a common and often overlooked entry point where services store credentials in their command-line flags.
+
+**Example of what gets caught:**
+
+```
+iso.3.6.1.2.1.25.4.2.1.5.976  = STRING: "-c sleep 30; /bin/bash -c '/usr/bin/host_check -u daniel -p HotelBabylon23'"
+iso.3.6.1.2.1.25.4.2.1.5.1144 = STRING: "-u daniel -p HotelBabylon23"
+```
+
+EnumX extracts and displays the credentials immediately:
+
+```
+[*] Credentials leaked in public_161.txt:
+    username : daniel
+    password : HotelBabylon23
+```
+
+The extracted credentials are:
+- Printed in red to the terminal
+- Added to the **live session cred manager** — automatically reused by every subsequent module (SMB, SSH, DB, AD, lateral movement)
+- Added to the report as a **CRITICAL** finding at the top of `report.md` and `report.html`
+
+**Credential patterns detected:**
+
+| Pattern | Example |
+|---|---|
+| `-u USER -p PASS` | `-u daniel -p HotelBabylon23` |
+| `-U USER -P PASS` | `-U admin -P secret123` |
+| `--username USER --password PASS` | `--username john --password Welcome1` |
+| `username=USER password=PASS` | `username=sa password=admin` |
+| `user=USER pass=PASS` | `user=root pass=toor` |
+
+If a line contains suspicious keywords (`passw`, `secret`, `token`, `apikey`) but doesn't match a known pattern, it's saved to `snmp/cred_hints_<community>_<port>.txt` and flagged **HIGH** for manual review.
+
 ---
 
 ### 12. Database Attacks
